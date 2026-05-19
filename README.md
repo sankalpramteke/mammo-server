@@ -1,138 +1,231 @@
-# mammo-server — Complete In-Depth Guide
+# DISHA — mammo-server
 
-> **Purpose**: The local hospital node (AI inference engine). It receives mammogram images, runs predictions using a local ResNet50 model, queues confirmed diagnoses from doctors, and performs local Federated Learning (FL) training before sending the model weights to the global server.
-
----
-
-## 1. Technology Stack
-
-| Technology | Version | Why We Used It |
-|---|---|---|
-| **FastAPI** | 0.110.0 | High-performance Python web framework. Perfect for AI microservices because it's fast, asynchronous, and auto-generates API docs (Swagger). |
-| **Uvicorn** | 0.27.0 | ASGI web server used to run the FastAPI application. |
-| **TensorFlow / Keras** | >=2.16.0 | The core AI engine. Used to load the `mammo_v2.h5` model (ResNet50), run image inference, and perform local fine-tuning (backpropagation) for FL. |
-| **Pillow (PIL)** | 10.2.0 | Image processing library. Used to read the uploaded multipart image and convert it into RGB arrays. |
-| **NumPy** | 1.26.4 | Array manipulation. Used to resize and normalize the image arrays (shape: 1x224x224x3) before feeding them into TensorFlow. |
-| **aiohttp** | 3.9.3 | Asynchronous HTTP client. Used to send the model weight updates and the 30-second heartbeat to the `mammo-global` server without blocking FastAPI. |
-| **python-multipart** | 0.0.9 | Required by FastAPI to parse `multipart/form-data` (file uploads) correctly. |
-| **python-dotenv** | 1.0.1 | Loads environment variables from `.env` file (`HOSPITAL_ID`, `GLOBAL_SERVER_URL` etc.). |
+> **Local Hospital Training Node — Privacy-First Federated Learning**
+>
+> mammo-server is a FastAPI Python server that runs inside each hospital. Doctors upload mammogram images here, the AI model trains on them entirely in memory, and only a mathematically-noised summary of what it learned is sent to the global coordinator — never the images themselves.
 
 ---
 
-## 2. Project Architecture
+## What Does This Do?
 
-```mermaid
-graph LR
-    subgraph "mammo-client (:3000)"
-        MC["Next.js Front-end"]
-    end
-    
-    subgraph "mammo-server (:8000)"
-        FA["FastAPI Endpoints"]
-        TF["TensorFlow Model"]
-        Q["In-Memory Queue"]
-    end
-    
-    subgraph "mammo-global (:3001)"
-        MG["Global Dashboard"]
-    end
-    
-    MC -->|1. Upload Image| FA
-    FA --> TF
-    TF -->|Prediction| MC
-    
-    MC -->|2. Confirm Diagnosis| Q
-    
-    FA -->|3. Trigger /train| TF
-    TF -->|Fine-tune on Queue| TF
-    TF -->|4. Send Weights (aiohttp)| MG
-    
-    FA -->|Heartbeat loop| MG
+mammo-server is the **private training environment** that runs on a hospital's own machine. It:
+
+1. Receives mammogram images from the hospital portal
+2. Trains the AI model on those images (in RAM — nothing saved to disk)
+3. Adds privacy-preserving noise to the model's learning (Differential Privacy)
+4. Sends only the noised weight update to mammo-global
+5. Deletes all image data immediately after training
+
+Patient images **never leave the hospital**. This is the fundamental privacy guarantee.
+
+---
+
+## System Flow
+
+```
+Doctor uploads ZIP / images
+         │
+         ▼
+┌─────────────────────────────────┐
+│   POST /train-dataset           │
+│                                 │
+│  1. Extract images from ZIP     │
+│     (in RAM — never on disk)    │
+│                                 │
+│  2. For each image:             │
+│     • Apply CLAHE preprocessing │
+│     • Train model (1 step)      │
+│     • Delete image from memory  │
+│     • Run garbage collector     │
+│                                 │
+│  3. Compute weight delta        │
+│     (new_weights - old_weights) │
+│                                 │
+│  4. Apply Differential Privacy  │
+│     • Clip L2-norm of delta     │
+│     • Add Gaussian noise        │
+│                                 │
+│  5. SHA-256 hash the result     │
+│                                 │
+│  6. Send noised delta to        │
+│     mammo-global aggregator     │
+│                                 │
+│  7. Return audit proof to UI    │
+└─────────────────────────────────┘
+         │
+         ▼
+Images permanently gone from memory
+Only the weight hash remains
 ```
 
-### Key Architectural Decisions
-1. **Separation of Concerns**: This server *only* handles heavy AI tasks (inference & training). It does not handle user authentication, UI, or persistent historical data (that's handled by Next.js and MongoDB).
-2. **In-Memory Training Queue**: Instead of writing confirmed scans to a database, they are temporarily held in RAM (`training_queue`). When `/train` is called, it digests the queue, trains, and clears it.
-3. **Async Heartbeat**: A background `asyncio` loop continuously pings `mammo-global` to report that this hospital node is online, showing the real-time node status on the global map.
+---
+
+## Technology Stack
+
+| Technology | Purpose |
+|---|---|
+| **FastAPI** | High-performance Python web framework |
+| **TensorFlow / Keras** | ResNet50-based mammogram classification model |
+| **Pillow (PIL)** | Image decoding and CLAHE preprocessing |
+| **NumPy** | Weight delta computation and DP noise generation |
+| **aiohttp** | Async HTTP client for sending weights to mammo-global |
+| **python-dotenv** | Environment variable management |
 
 ---
 
-## 3. Core Features & Federated Learning Flow
+## Features
 
-Following the Federated Learning pattern, this node acts as **Step A and Step B**.
+### 1. Privacy-First Training Pipeline
+- Images are loaded one at a time into RAM using `io.BytesIO`
+- Each image is trained on using `model.train_on_batch()` (1 gradient step)
+- The image bytes and numpy arrays are deleted immediately (`del` + `gc.collect()`)
+- **Zero disk writes** — no image is ever saved to disk at any point
 
-### Feature 1: AI Inference (Step A)
-- **Endpoint**: `POST /predict`
-- **How it works**: Receives an image from `mammo-client`. Preprocesses it to 224x224 pixels, normalizes it, and passes it through the loaded ResNet50 model.
-- **Output**: Returns "Benign" or "Malignant" with exact confidence percentages.
+### 2. Differential Privacy (Gaussian Mechanism)
+Protects against **gradient inversion attacks**, where an attacker can mathematically reconstruct the original training images from the transmitted weight updates.
 
-### Feature 2: Queuing Expert Confirmations
-- **Endpoint**: `POST /queue-for-training`
-- **How it works**: When a doctor corrects or confirms the AI's prediction on the client UI, this endpoint receives the "True Label" (e.g., patient actually has Malignant cancer) and stores it in the `training_queue`.
+- **Step 1:** Computes the weight delta (change after training)
+- **Step 2:** Clips the L2-norm of the delta to a sensitivity bound `S`
+- **Step 3:** Adds calibrated Gaussian noise: `σ = S × √(2 × ln(1.25/δ)) / ε`
+- **Result:** Provides formal `(ε, δ)`-differential privacy guarantee
 
-### Feature 3: Local FL Training (Step B)
-- **Endpoint**: `POST /train` (Triggered manually or via chron job)
-- **How it works**: 
-  1. Reads the `training_queue`.
-  2. Compiles a tiny dataset from these true labels.
-  3. Uses **TensorFlow `model.fit()`** to fine-tune the top layers of the local ResNet50 model (local learning).
-  4. Calculates the **Weight Delta** (difference between old weights and newly trained weights).
-  5. Slices the first 5 layers of the weight matrix and sends them via an async HTTP POST to `mammo-global/api/fl/receive-weights`.
-  6. Empties the queue.
+Default settings: `ε = 1.0`, `δ = 1e-5` — strong privacy with minimal accuracy loss.
 
-### Feature 4: Realistic Accuracy Simulation
-- **How it works**: In a demo with 1 sample, training accuracy trivially hits 100%. To simulate a realistic, multi-hospital FL progression, the server tracks `_fl_round_counter` and gradually increments the reported accuracy (starting ~72%, adding 1-3% per round, capping at 94%).
+### 3. ZIP Dataset Support
+- Accepts a single ZIP file containing any folder structure of JPEG/PNG images
+- Extracts entirely in RAM (no temp files)
+- Handles nested subfolders automatically (e.g., `dataset/images/scan.jpg`)
+- Skips macOS metadata files (`__MACOSX`) automatically
+- Hard limit: 500 images per upload, 500 MB ZIP size
+
+### 4. Cryptographic Audit Trail
+- After every training run, a SHA-256 hash of the final weight layer is computed
+- This hash is the "privacy proof" — it proves training happened without revealing the images
+- Full audit entry is appended to `audit_log.jsonl` (survives server restarts)
+- Available via `GET /training-audit` for evaluator review
+
+### 5. Mammogram Image Preprocessing (CLAHE)
+- CLAHE (Contrast Limited Adaptive Histogram Equalization) is applied to every image
+- This is the standard preprocessing pipeline for mammogram AI — it enhances local tissue contrast without amplifying noise
+- Matches the preprocessing used in the original CBIS-DDSM training run
+
+### 6. Heartbeat to mammo-global
+- Background task pings mammo-global every 30 seconds
+- Keeps the hospital node status as "Online" on the admin dashboard
+- Silently handles connectivity failures (no crash if global server is offline)
 
 ---
 
-## 4. API Endpoints — Deep Dive
+## Security Features
 
-| Method | Endpoint | Description |
+### Endpoint Authentication
+| Feature | Detail |
+|---|---|
+| X-API-Key | `/train-dataset` and `/training-audit` require a valid API key in the request header |
+| Shared secret | Key must match `NODE_API_KEY` set in `.env` and `MAMMO_NODE_API_KEY` in mammo-global |
+
+### Input Validation
+| Feature | Detail |
+|---|---|
+| ZIP size limit | Hard 500 MB cap before any extraction begins |
+| Image count limit | Maximum 500 images per training session |
+| CORS whitelist | Only configured origins can make requests (not `*`) |
+| File type check | Only `.jpg`, `.jpeg`, `.png` extensions accepted from ZIP contents |
+
+### Differential Privacy
+| Parameter | Default | Meaning |
 |---|---|---|
-| `GET` | `/` | Health check. Returns status and whether the model loaded successfully. |
-| `POST` | `/predict` | **Core inference**. Expects `multipart/form-data` with a `file` field. Returns the AI diagnosis. |
-| `POST` | `/queue-for-training` | **Feedback loop**. Accepts JSON `{ patientId, confirmedLabel }`. Adds to the training queue. |
-| `POST` | `/train` | **FL Engine**. Fine-tunes the local TensorFlow model on the queued labels, sends weights to global, and returns the realistic accuracy progression. |
-| `GET` | `/training-queue` | Debug endpoint to view currently queued scans. |
+| `DP_EPSILON` | `1.0` | Privacy budget — lower = more private, more noise |
+| `DP_DELTA` | `1e-5` | Failure probability — effectively zero risk |
+| `DP_L2_SENSITIVITY` | `1.0` | Maximum allowed weight change per image |
 
 ---
 
-## 5. Environment Variables & Setup
+## API Endpoints
 
-| Variable | Example | Explanation |
-|---|---|---|
-| `HOSPITAL_ID` | `AIIMS_NAGPUR` | The unique identifier for this node. Used so `mammo-global` knows where the weights came from. |
-| `MODEL_PATH` | `./mammo_v2.h5` | Path to the pre-trained TensorFlow/Keras `.h5` model file. |
-| `GLOBAL_SERVER_URL`| `http://localhost:3001` | Where to send weight updates and heartbeats. |
+| Method | Endpoint | Auth | Description |
+|---|---|---|---|
+| `GET` | `/` | None | Health check — returns server status and model load state |
+| `GET` | `/training-status` | None | Returns model accuracy metrics from last training run |
+| `GET` | `/training-queue` | None | Returns current training queue size |
+| `GET` | `/training-audit` | API Key | Full audit log of last training session (privacy proof) |
+| `POST` | `/train-dataset` | API Key | Main training endpoint — accepts images or ZIP |
+| `POST` | `/predict` | None | Run inference on a single mammogram image |
 
-### How to Run
+---
+
+## Setup & Running
+
+### Prerequisites
+- Python 3.10+
+- The trained model file: `mammo_v2.h5` (ResNet50 fine-tuned on CBIS-DDSM)
+- Windows: Run with `--loop asyncio` flag (see below)
+
+### Installation
+
 ```bash
 # Create virtual environment
 python -m venv venv
-source venv/bin/activate  # or `venv\Scripts\activate` on Windows
+
+# Activate (Windows)
+venv\Scripts\activate
+
+# Activate (Mac/Linux)
+source venv/bin/activate
 
 # Install dependencies
 pip install -r requirements.txt
 
-# Start FastAPI server
-uvicorn main:app --reload --port 8000
+# Copy and configure environment
+# Edit .env with your values
+
+# Start the server
+python -m uvicorn main:app --port 8000 --loop asyncio
 ```
+
+### Environment Variables
+
+| Variable | Default | Description |
+|---|---|---|
+| `HOSPITAL_ID` | `HOSPITAL_01` | Unique identifier for this hospital node |
+| `MODEL_PATH` | `./mammo_v2.h5` | Path to the trained ResNet50 model file |
+| `METRICS_PATH` | `./model_metrics.json` | Path to model validation metrics |
+| `GLOBAL_SERVER_URL` | `http://localhost:3001` | URL of the mammo-global coordinator |
+| `NODE_API_KEY` | *(empty)* | API key for endpoint authentication |
+| `ALLOWED_ORIGINS` | `http://localhost:3001,...` | Comma-separated CORS allowed origins |
+| `AUDIT_LOG_PATH` | `./audit_log.jsonl` | Path to the append-only audit log |
+| `DP_ENABLED` | `true` | Enable/disable Differential Privacy |
+| `DP_EPSILON` | `1.0` | Privacy budget (ε) |
+| `DP_DELTA` | `1e-5` | Failure probability (δ) |
+| `DP_L2_SENSITIVITY` | `1.0` | Weight delta clip threshold |
 
 ---
 
-## 6. Likely Q&A for Evaluators
+## Model Information
 
-**Q: Why use FastAPI for this instead of integrating the AI into Next.js?**
-**A:** Python is the native ecosystem for AI (TensorFlow/PyTorch). Running large `.h5` models in Node.js (Next.js) is highly inefficient and memory-intensive. A dedicated Python microservice (FastAPI) is the industry standard for serving ML models natively.
+The AI model (`mammo_v2.h5`) is a **ResNet50** architecture fine-tuned on the **CBIS-DDSM dataset** (Curated Breast Imaging Subset of DDSM) — a benchmark dataset of 10,556 mammogram images with expert annotations.
 
-**Q: Does mammo-server save the patient images?**
-**A:** No. `mammo-server` processes the image array in RAM during `/predict` and then discards it. This guarantees patient privacy because no sensitive data is permanently stored on the disk.
+| Metric | Value |
+|---|---|
+| Base architecture | ResNet50 (ImageNet pretrained) |
+| Dataset | CBIS-DDSM |
+| Training samples | 10,556 mammograms |
+| Validation accuracy | 92.1% |
+| Input size | 224 × 224 × 3 |
+| Output | Binary (Benign / Malignant) |
 
-**Q: How does the Federated Learning training actually happen here?**
-**A:** We use `model.fit()` on the base TensorFlow model using the labels provided by the doctor. We compile it with an extremely low learning rate (`1e-5`) to prevent "catastrophic forgetting" (where the model forgets its base training). We then calculate the absolute difference in the weight matrices and send only that delta to the global server.
+---
 
-**Q: Why do you send only the first 5 layers of weights?**
-**A:** In this prototype, weight matrices are massive (hundreds of MBs). To make the HTTP POST request fast and avoid timeouts on localhost, we slice the array (`weights_list[:5]`) as a proof-of-concept. In a production gRPC architecture, we would stream the entire tensor.
+## Frequently Asked Questions
 
-**Q: Why is the accuracy simulated?**
-**A:** Because we are training on 1 or 2 small synthetic noise arrays (as a stand-in for real image datasets), a neural network will instantly memorize the data and report 100% accuracy. The simulation demonstrates the *expected mathematical progression* (FedAvg asymptotic convergence) of a real FL network over time.
+**Q: Where are the uploaded images stored?**
+> They are never stored. Images are decoded into NumPy arrays in RAM, trained on, and immediately deleted. The `audit_log.jsonl` confirms this: `"images_written_to_disk": 0`.
+
+**Q: Can someone reconstruct patient images from the weight updates?**
+> This is prevented by Differential Privacy. Before any weight delta is transmitted, calibrated Gaussian noise is added. The mathematical guarantee is that even an adversary with unlimited computing power cannot distinguish between a model trained on Patient A's data vs. a model trained without it — to within the `ε` privacy budget.
+
+**Q: What if the global server is unreachable?**
+> Training completes normally. The weight delta transmission is attempted and fails silently. The audit log and SHA-256 hash are still generated locally. When the global server comes back online, the next training run will submit normally.
+
+**Q: Why use `train_on_batch` instead of `model.fit`?**
+> `train_on_batch` gives us per-image control. We can delete each image immediately after its gradient step, keeping memory usage constant regardless of dataset size. With `model.fit`, all images would need to be loaded simultaneously.
