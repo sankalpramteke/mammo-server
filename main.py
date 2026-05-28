@@ -66,7 +66,7 @@ async def heartbeat_loop():
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.post(f"{global_url}/api/hospitals", json=payload) as resp:
-            print(f"INFO: Heartbeat sent to {global_url}")
+                    print(f"INFO: Heartbeat sent to {global_url}")
         except Exception:
             pass  # Global server may be offline during local-only training
         
